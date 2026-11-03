@@ -1,0 +1,100 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: moneylens-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-moneylens}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-moneylens_secure_password}
+      POSTGRES_DB: ${POSTGRES_DB:-moneylens}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U moneylens -d moneylens"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: moneylens-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: moneylens-backend
+    restart: unless-stopped
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./backend:/app
+      - statement_uploads:/app/uploads
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://moneylens:moneylens_secure_password@postgres:5432/moneylens
+      - DATABASE_URL_SYNC=postgresql+psycopg://moneylens:moneylens_secure_password@postgres:5432/moneylens
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-secret-key-32-chars-long-development-only}
+      - LLM_PROVIDER=${LLM_PROVIDER:-groq}
+      - LLM_API_KEY=${LLM_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: moneylens-celery
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app.celery worker --loglevel=info
+    volumes:
+      - ./backend:/app
+      - statement_uploads:/app/uploads
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://moneylens:moneylens_secure_password@postgres:5432/moneylens
+      - DATABASE_URL_SYNC=postgresql+psycopg://moneylens:moneylens_secure_password@postgres:5432/moneylens
+      - REDIS_URL=redis://redis:6379/0
+      - SECRET_KEY=${SECRET_KEY:-secret-key-32-chars-long-development-only}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: moneylens-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api/v1
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  redis_data:
+  statement_uploads:
