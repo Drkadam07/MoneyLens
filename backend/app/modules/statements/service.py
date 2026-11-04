@@ -1,3 +1,4 @@
+# backend/app/modules/statements/service.py
 import os
 import uuid
 from datetime import datetime, timezone
@@ -5,6 +6,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from fastapi import UploadFile
+from app.database.models import statement
+
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -53,14 +56,16 @@ class StatementService:
         )
         account = result.scalar_one_or_none()
         if not account:
-            raise NotFoundError(f"Bank account '{account_id}' not found or access denied")
+            raise NotFoundError(
+                f"Bank account '{account_id}' not found or access denied"
+            )
         return account
 
     async def upload_statement(
         self,
         account_id: uuid.UUID,
         file: UploadFile,
-    ) -> Statement:
+    ) -> tuple[Statement, uuid.UUID]:
         # 1. Verify account ownership
         await self._verify_account_ownership(account_id)
 
@@ -68,7 +73,9 @@ class StatementService:
         content = await file.read()
         max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
         if len(content) > max_bytes:
-            raise FileTooLargeError(f"File size exceeds maximum {settings.MAX_UPLOAD_SIZE_MB}MB")
+            raise FileTooLargeError(
+                f"File size exceeds maximum {settings.MAX_UPLOAD_SIZE_MB}MB"
+            )
 
         # 3. Compute SHA-256 for idempotency
         file_hash = StatementValidator.compute_sha256(content)
@@ -79,12 +86,16 @@ class StatementService:
             )
         )
         if existing_stmt.scalar_one_or_none():
-            raise ConflictError("This statement has already been uploaded for this account (identical file hash)")
+            raise ConflictError(
+                "This statement has already been uploaded for this account (identical file hash)"
+            )
 
         # 4. Save file to disk
         file_ext = Path(file.filename or "statement.pdf").suffix.lower()
         if file_ext not in [".csv", ".xlsx", ".xls", ".pdf"]:
-            raise UnsupportedStatementFormatError(f"Unsupported file format '{file_ext}'. Allowed: .csv, .xlsx, .pdf")
+            raise UnsupportedStatementFormatError(
+                f"Unsupported file format '{file_ext}'. Allowed: .csv, .xlsx, .pdf"
+            )
 
         storage_filename = f"{uuid.uuid4()}{file_ext}"
         upload_path = Path(settings.UPLOAD_DIR)
@@ -112,13 +123,33 @@ class StatementService:
             status=StatementStatus.PROCESSING,
             started_at=datetime.now(timezone.utc),
         )
+        # self.db.add(job)
+        # await self.db.commit()
+
+        # # 6. Parse and extract records
+        # await self._process_statement_internal(statement, job, file_dest)
+        # await self.db.refresh(statement)
+        # return statement
+
         self.db.add(job)
+
+        # Persist the job and obtain its ID.
+        await self.db.flush()
+        job_id = job.id
+
         await self.db.commit()
 
-        # 6. Parse and extract records
-        await self._process_statement_internal(statement, job, file_dest)
+        # 6. Parse and extract records.
+        await self._process_statement_internal(
+            statement,
+            job,
+            file_dest,
+        )
+
+        # Refresh statement attributes after processing.
         await self.db.refresh(statement)
-        return statement
+
+        return statement, job_id
 
     async def _process_statement_internal(
         self, statement: Statement, job: StatementImportJob, file_path: Path
@@ -134,7 +165,9 @@ class StatementService:
                 parser = PDFStatementParser()
 
             if not parser:
-                raise UnsupportedStatementFormatError(f"No parser available for {file_path.suffix}")
+                raise UnsupportedStatementFormatError(
+                    f"No parser available for {file_path.suffix}"
+                )
 
             raw_extracted = parser.extract(file_path)
             normalized_records = parser.normalize(raw_extracted)
@@ -145,14 +178,18 @@ class StatementService:
                 statement.status = StatementStatus.FAILED
                 job.status = StatementStatus.FAILED
                 job.error_code = "NO_RECORDS_EXTRACTED"
-                job.error_message = "Could not extract any valid financial rows from file."
+                job.error_message = (
+                    "Could not extract any valid financial rows from file."
+                )
                 job.completed_at = datetime.now(timezone.utc)
                 await self.db.commit()
                 return
 
             # Statement Validation
             statement.status = StatementStatus.VALIDATING
-            is_valid, validation_warnings = StatementValidator.validate_statement_records(normalized_records)
+            is_valid, validation_warnings = (
+                StatementValidator.validate_statement_records(normalized_records)
+            )
 
             for w in validation_warnings:
                 warning_rec = StatementImportWarning(
@@ -164,7 +201,11 @@ class StatementService:
                 self.db.add(warning_rec)
 
             # Store rows in statement_rows staging table
-            dates = [r["transaction_date"] for r in normalized_records if r.get("transaction_date")]
+            dates = [
+                r["transaction_date"]
+                for r in normalized_records
+                if r.get("transaction_date")
+            ]
             if dates:
                 statement.period_start = min(dates)
                 statement.period_end = max(dates)
@@ -227,27 +268,35 @@ class StatementService:
         parsed_rows = [row.raw_payload for row in statement.rows]
 
         # Deduplication check against existing transactions
-        deduplicator = TransactionDeduplicator(self.db, self.user_id, statement.account_id)
+        deduplicator = TransactionDeduplicator(
+            self.db, self.user_id, statement.account_id
+        )
         dedup_results = await deduplicator.detect_duplicates(parsed_rows)
 
         preview_rows = []
         for cand, matched_existing, confidence in dedup_results:
-            preview_rows.append({
-                "row_number": cand.get("row_number", 0),
-                "transaction_date": cand.get("transaction_date"),
-                "description_original": cand.get("description_original", ""),
-                "description_normalized": cand.get("description_normalized", ""),
-                "debit_amount": Decimal(str(cand.get("debit_amount", 0))),
-                "credit_amount": Decimal(str(cand.get("credit_amount", 0))),
-                "balance_after": Decimal(str(cand["balance_after"])) if cand.get("balance_after") is not None else None,
-                "reference_number": cand.get("reference_number"),
-                "payment_method": cand.get("payment_method", "OTHER"),
-                "transaction_kind": cand.get("transaction_kind", "UNCLASSIFIED"),
-                "merchant_guess": cand.get("merchant_guess"),
-                "is_duplicate_candidate": confidence >= 0.85,
-                "duplicate_confidence": confidence,
-                "duplicate_match_details": matched_existing,
-            })
+            preview_rows.append(
+                {
+                    "row_number": cand.get("row_number", 0),
+                    "transaction_date": cand.get("transaction_date"),
+                    "description_original": cand.get("description_original", ""),
+                    "description_normalized": cand.get("description_normalized", ""),
+                    "debit_amount": Decimal(str(cand.get("debit_amount", 0))),
+                    "credit_amount": Decimal(str(cand.get("credit_amount", 0))),
+                    "balance_after": (
+                        Decimal(str(cand["balance_after"]))
+                        if cand.get("balance_after") is not None
+                        else None
+                    ),
+                    "reference_number": cand.get("reference_number"),
+                    "payment_method": cand.get("payment_method", "OTHER"),
+                    "transaction_kind": cand.get("transaction_kind", "UNCLASSIFIED"),
+                    "merchant_guess": cand.get("merchant_guess"),
+                    "is_duplicate_candidate": confidence >= 0.85,
+                    "duplicate_confidence": confidence,
+                    "duplicate_match_details": matched_existing,
+                }
+            )
 
         return {
             "statement_id": statement.id,
@@ -304,7 +353,11 @@ class StatementService:
                 merchant_id = merchant.id
 
             tx_date_str = payload.get("transaction_date")
-            tx_date = datetime.strptime(tx_date_str, "%Y-%m-%d").date() if tx_date_str else datetime.now(timezone.utc).date()
+            tx_date = (
+                datetime.strptime(tx_date_str, "%Y-%m-%d").date()
+                if tx_date_str
+                else datetime.now(timezone.utc).date()
+            )
 
             # Method & Kind mapping
             try:
@@ -313,7 +366,9 @@ class StatementService:
                 method_enum = PaymentMethod.OTHER
 
             try:
-                kind_enum = TransactionKind(payload.get("transaction_kind", "UNCLASSIFIED"))
+                kind_enum = TransactionKind(
+                    payload.get("transaction_kind", "UNCLASSIFIED")
+                )
             except ValueError:
                 kind_enum = TransactionKind.UNCLASSIFIED
 
@@ -328,7 +383,11 @@ class StatementService:
                 debit_amount=Decimal(str(payload.get("debit_amount", 0))),
                 credit_amount=Decimal(str(payload.get("credit_amount", 0))),
                 currency="INR",
-                balance_after=Decimal(str(payload["balance_after"])) if payload.get("balance_after") is not None else None,
+                balance_after=(
+                    Decimal(str(payload["balance_after"]))
+                    if payload.get("balance_after") is not None
+                    else None
+                ),
                 reference_number=payload.get("reference_number"),
                 payment_method=method_enum,
                 transaction_kind=kind_enum,
@@ -342,22 +401,53 @@ class StatementService:
         await self.db.commit()
         return imported_count
 
+    # async def list_statements(self) -> List[Statement]:
+    #     res = await self.db.execute(
+    #         select(Statement)
+    #         .where(Statement.user_id == self.user_id)
+    #         .order_by(Statement.created_at.desc())
+    #     )
+    #     return res.scalars().all()
+
     async def list_statements(self) -> List[Statement]:
         res = await self.db.execute(
             select(Statement)
+            .options(selectinload(Statement.warnings))
             .where(Statement.user_id == self.user_id)
             .order_by(Statement.created_at.desc())
         )
+
         return res.scalars().all()
 
-    async def get_statement(self, statement_id: uuid.UUID) -> Statement:
+    # async def get_statement(self, statement_id: uuid.UUID) -> Statement:
+    #     res = await self.db.execute(
+    #         select(Statement).where(
+    #             Statement.id == statement_id,
+    #             Statement.user_id == self.user_id,
+    #         )
+    #     )
+    #     stmt = res.scalar_one_or_none()
+    #     if not stmt:
+    #         raise NotFoundError(f"Statement '{statement_id}' not found")
+    #     return stmt
+
+    async def get_statement(
+        self,
+        statement_id: uuid.UUID,
+    ) -> Statement:
+
         res = await self.db.execute(
-            select(Statement).where(
+            select(Statement)
+            .options(selectinload(Statement.warnings))
+            .where(
                 Statement.id == statement_id,
                 Statement.user_id == self.user_id,
             )
         )
+
         stmt = res.scalar_one_or_none()
+
         if not stmt:
             raise NotFoundError(f"Statement '{statement_id}' not found")
+
         return stmt
