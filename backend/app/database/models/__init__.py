@@ -1,0 +1,78 @@
+from app.database.base import Base, CommonMixin
+from app.database.models.user import User, UserPreference, AuthSession
+from app.database.models.account import BankAccount
+from app.database.models.statement import (
+    Statement,
+    StatementStatus,
+    StatementImportJob,
+    StatementImportWarning,
+    StatementRow,
+)
+from app.database.models.transaction import (
+    Transaction,
+    TransactionKind,
+    PaymentMethod,
+    ReviewStatus,
+    ClassificationSource,
+    CategoryType,
+    Category,
+    TransactionClassification,
+    Merchant,
+    MerchantAlias,
+    UserCategorizationRule,
+    TransactionTransfer,
+    TransactionNote,
+)
+from app.database.models.planning import (
+    Budget,
+    FinancialGoal,
+    RecurringPayment,
+)
+from app.database.models.intelligence import (
+    AnomalyEvent,
+    ExpenseForecast,
+    FinancialInsight,
+    KnowledgeDocument,
+    KnowledgeChunk,
+    ChatSession,
+    ChatMessage,
+    AuditLog,
+)
+
+__all__ = [
+    "Base",
+    "CommonMixin",
+    "User",
+    "UserPreference",
+    "AuthSession",
+    "BankAccount",
+    "Statement",
+    "StatementStatus",
+    "StatementImportJob",
+    "StatementImportWarning",
+    "StatementRow",
+    "Transaction",
+    "TransactionKind",
+    "PaymentMethod",
+    "ReviewStatus",
+    "ClassificationSource",
+    "CategoryType",
+    "Category",
+    "TransactionClassification",
+    "Merchant",
+    "MerchantAlias",
+    "UserCategorizationRule",
+    "TransactionTransfer",
+    "TransactionNote",
+    "Budget",
+    "FinancialGoal",
+    "RecurringPayment",
+    "AnomalyEvent",
+    "ExpenseForecast",
+    "FinancialInsight",
+    "KnowledgeDocument",
+    "KnowledgeChunk",
+    "ChatSession",
+    "ChatMessage",
+    "AuditLog",
+]
