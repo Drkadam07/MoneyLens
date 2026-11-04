@@ -19,7 +19,11 @@ from app.modules.statements.service import StatementService
 router = APIRouter(prefix="/statements", tags=["Statements"])
 
 
-@router.post("/upload", response_model=StatementUploadResponse, status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/upload",
+    response_model=StatementUploadResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def upload_statement(
     account_id: Annotated[uuid.UUID, Form()],
     file: Annotated[UploadFile, File()],
@@ -27,10 +31,15 @@ async def upload_statement(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     service = StatementService(db, current_user.id)
-    statement = await service.upload_statement(account_id, file)
+
+    statement, job_id = await service.upload_statement(
+        account_id,
+        file,
+    )
+
     return StatementUploadResponse(
         statement_id=statement.id,
-        job_id=statement.jobs[0].id if statement.jobs else statement.id,
+        job_id=job_id,
         status=statement.status,
         message="Statement uploaded and validated. Review preview records.",
     )
@@ -80,7 +89,10 @@ async def confirm_statement_import(
 ):
     service = StatementService(db, current_user.id)
     count = await service.confirm_statement(statement_id, request.confirmed_row_numbers)
-    return {"message": f"Successfully imported and confirmed {count} transactions.", "imported_count": count}
+    return {
+        "message": f"Successfully imported and confirmed {count} transactions.",
+        "imported_count": count,
+    }
 
 
 @router.get("/{statement_id}", response_model=StatementResponse)
