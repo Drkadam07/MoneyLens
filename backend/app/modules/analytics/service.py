@@ -1,8 +1,9 @@
+#backend/app/modules/analytics/service.py
 import uuid
 from datetime import date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
-from sqlalchemy import func, select
+from sqlalchemy import func, select , case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models.transaction import Transaction, TransactionKind
@@ -40,13 +41,13 @@ class AnalyticsService:
             select(
                 Transaction.transaction_date,
                 func.sum(
-                    func.case(
+                    case(
                         (Transaction.transaction_kind == TransactionKind.INCOME, Transaction.credit_amount),
                         else_=0,
                     )
                 ).label("income"),
                 func.sum(
-                    func.case(
+                    case(
                         (Transaction.transaction_kind == TransactionKind.EXPENSE, Transaction.debit_amount),
                         else_=0,
                     )
@@ -85,13 +86,13 @@ class AnalyticsService:
             select(
                 func.to_char(Transaction.transaction_date, "YYYY-MM").label("month"),
                 func.sum(
-                    func.case(
+                    case(
                         (Transaction.transaction_kind == TransactionKind.INCOME, Transaction.credit_amount),
                         else_=0,
                     )
                 ).label("income"),
                 func.sum(
-                    func.case(
+                    case(
                         (Transaction.transaction_kind == TransactionKind.EXPENSE, Transaction.debit_amount),
                         else_=0,
                     )
