@@ -5,6 +5,7 @@ celery = Celery(
     "moneylens_tasks",
     broker=settings.REDIS_URL,
     backend=settings.REDIS_URL,
+    include=["app.workers.statement_tasks"],
 )
 
 celery.conf.update(
