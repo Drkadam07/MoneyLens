@@ -22,6 +22,7 @@ export const StatementUploadWizard: React.FC = () => {
   const [previewData, setPreviewData] = useState<StatementPreviewResponse | null>(null);
   const [activeStatementId, setActiveStatementId] = useState<string | null>(null);
   const [isConfirming, setIsConfirming] = useState(false);
+  const [retryingStatementId, setRetryingStatementId] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -69,17 +70,33 @@ export const StatementUploadWizard: React.FC = () => {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       const stmtId = resp.data.statement_id;
+      const jobId = resp.data.job_id;
       setActiveStatementId(stmtId);
-      setUploadProgress('Extracting and verifying balance equations...');
-
-      // Fetch preview
-      const prevResp = await api.get<StatementPreviewResponse>(`/statements/${stmtId}/preview`);
-      setPreviewData(prevResp.data);
+      setUploadProgress('Statement queued. Extracting transactions...');
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        const jobResp = await api.get(`/statements/jobs/${jobId}`);
+        const job = jobResp.data;
+        if (job.status === 'FAILED') {
+          throw new Error(job.error_message || 'Statement extraction failed.');
+        }
+        if (job.status === 'REVIEW_REQUIRED') {
+          const prevResp = await api.get<StatementPreviewResponse>(`/statements/${stmtId}/preview`);
+          setPreviewData(prevResp.data);
+          break;
+        }
+        setUploadProgress(
+          job.total_rows > 0
+            ? `Extracting transactions... ${job.processed_rows} of ${job.total_rows}`
+            : 'Extracting transactions...'
+        );
+        if (attempt === 119) throw new Error('Extraction is taking longer than expected. Check the statement list shortly.');
+      }
       setUploadProgress(null);
       fetchAccountsAndStatements();
     } catch (err: any) {
       setErrorMessage(
-        err.response?.data?.error?.message || 'Upload failed. Check format and permissions.'
+        err.message || err.response?.data?.error?.message || 'Upload failed. Check format and permissions.'
       );
       setUploadProgress(null);
     } finally {
@@ -110,6 +127,20 @@ export const StatementUploadWizard: React.FC = () => {
       setPreviewData(resp.data);
     } catch (err) {
       console.error('Failed to load preview:', err);
+    }
+  };
+
+  const retryExtraction = async (stmtId: string) => {
+    setRetryingStatementId(stmtId);
+    setErrorMessage(null);
+    try {
+      await api.post(`/statements/${stmtId}/retry`);
+      await fetchAccountsAndStatements();
+      setSuccessMessage('Extraction has been queued again.');
+    } catch (err: any) {
+      setErrorMessage(err.response?.data?.error?.message || 'Could not retry statement extraction.');
+    } finally {
+      setRetryingStatementId(null);
     }
   };
 
@@ -363,6 +394,15 @@ export const StatementUploadWizard: React.FC = () => {
                         className="text-xs font-semibold text-teal-400 hover:text-teal-300 transition"
                       >
                         Review Staging →
+                      </button>
+                    )}
+                    {(s.status === 'FAILED' || s.status === 'PROCESSING') && (
+                      <button
+                        onClick={() => retryExtraction(s.id)}
+                        disabled={retryingStatementId === s.id}
+                        className="ml-3 text-xs font-semibold text-amber-400 hover:text-amber-300 disabled:opacity-50 transition"
+                      >
+                        {retryingStatementId === s.id ? 'Queueing...' : 'Retry extraction'}
                       </button>
                     )}
                   </td>
