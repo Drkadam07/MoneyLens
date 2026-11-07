@@ -1,14 +1,14 @@
 # backend/app/modules/statements/service.py
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from fastapi import UploadFile
 from app.database.models import statement
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -85,7 +85,8 @@ class StatementService:
                 Statement.file_hash == file_hash,
             )
         )
-        if existing_stmt.scalar_one_or_none():
+        previous_statement = existing_stmt.scalar_one_or_none()
+        if previous_statement and previous_statement.status != StatementStatus.FAILED:
             raise ConflictError(
                 "This statement has already been uploaded for this account (identical file hash)"
             )
@@ -97,41 +98,61 @@ class StatementService:
                 f"Unsupported file format '{file_ext}'. Allowed: .csv, .xlsx, .pdf"
             )
 
-        storage_filename = f"{uuid.uuid4()}{file_ext}"
         upload_path = Path(settings.UPLOAD_DIR)
         upload_path.mkdir(parents=True, exist_ok=True)
-        file_dest = upload_path / storage_filename
+        file_dest = (
+            Path(previous_statement.storage_key)
+            if previous_statement
+            else upload_path / f"{uuid.uuid4()}{file_ext}"
+        )
         with open(file_dest, "wb") as f:
             f.write(content)
 
-        # 5. Create Statement record & Import Job
-        statement = Statement(
-            user_id=self.user_id,
-            account_id=account_id,
-            storage_key=str(file_dest),
-            original_filename=file.filename or "statement",
-            file_type=file_ext.replace(".", ""),
-            file_hash=file_hash,
-            status=StatementStatus.PROCESSING,
-        )
-        self.db.add(statement)
-        await self.db.flush()
+        # 5. Create a new import or reset a failed one for retry.
+        if previous_statement:
+            statement = previous_statement
+            job_result = await self.db.execute(
+                select(StatementImportJob).where(
+                    StatementImportJob.statement_id == statement.id,
+                    StatementImportJob.user_id == self.user_id,
+                )
+            )
+            job = job_result.scalar_one_or_none()
+            if not job:
+                raise ConflictError("Failed import has no job record and cannot be retried")
+            await self.db.execute(delete(StatementRow).where(StatementRow.statement_id == statement.id))
+            await self.db.execute(delete(StatementImportWarning).where(StatementImportWarning.statement_id == statement.id))
+            statement.original_filename = file.filename or statement.original_filename
+            statement.file_type = file_ext.replace(".", "")
+            statement.storage_key = str(file_dest)
+            statement.status = StatementStatus.PROCESSING
+            statement.period_start = statement.period_end = None
+            statement.opening_balance = statement.closing_balance = None
+            job.status = StatementStatus.PROCESSING
+            job.started_at = datetime.now(timezone.utc)
+            job.completed_at = None
+            job.error_code = job.error_message = None
+            job.total_rows = job.processed_rows = 0
+        else:
+            statement = Statement(
+                user_id=self.user_id,
+                account_id=account_id,
+                storage_key=str(file_dest),
+                original_filename=file.filename or "statement",
+                file_type=file_ext.replace(".", ""),
+                file_hash=file_hash,
+                status=StatementStatus.PROCESSING,
+            )
+            self.db.add(statement)
+            await self.db.flush()
 
-        job = StatementImportJob(
-            statement_id=statement.id,
-            user_id=self.user_id,
-            status=StatementStatus.PROCESSING,
-            started_at=datetime.now(timezone.utc),
-        )
-        # self.db.add(job)
-        # await self.db.commit()
-
-        # # 6. Parse and extract records
-        # await self._process_statement_internal(statement, job, file_dest)
-        # await self.db.refresh(statement)
-        # return statement
-
-        self.db.add(job)
+            job = StatementImportJob(
+                statement_id=statement.id,
+                user_id=self.user_id,
+                status=StatementStatus.PROCESSING,
+                started_at=datetime.now(timezone.utc),
+            )
+            self.db.add(job)
 
         # Persist the job and obtain its ID.
         await self.db.flush()
@@ -139,17 +160,86 @@ class StatementService:
 
         await self.db.commit()
 
-        # 6. Parse and extract records.
-        await self._process_statement_internal(
-            statement,
-            job,
-            file_dest,
-        )
-
-        # Refresh statement attributes after processing.
-        await self.db.refresh(statement)
+        # Extraction is CPU and I/O heavy, especially for PDFs. Queue it so the
+        # upload request can return immediately and the API event loop stays free.
+        from app.workers.statement_tasks import process_statement_task
+        try:
+            process_statement_task.delay(str(statement.id), str(file_dest))
+        except Exception as exc:
+            job.status = StatementStatus.FAILED
+            job.error_code = "QUEUE_FAILURE"
+            job.error_message = f"Could not queue statement extraction: {exc}"
+            statement.status = StatementStatus.FAILED
+            await self.db.commit()
 
         return statement, job_id
+
+    async def get_job_status(self, job_id: uuid.UUID) -> StatementImportJob:
+        result = await self.db.execute(
+            select(StatementImportJob).where(
+                StatementImportJob.id == job_id,
+                StatementImportJob.user_id == self.user_id,
+            )
+        )
+        job = result.scalar_one_or_none()
+        if not job:
+            raise NotFoundError(f"Import job '{job_id}' not found")
+        return job
+
+    async def retry_statement(self, statement_id: uuid.UUID) -> StatementImportJob:
+        result = await self.db.execute(
+            select(Statement).where(
+                Statement.id == statement_id,
+                Statement.user_id == self.user_id,
+            )
+        )
+        statement = result.scalar_one_or_none()
+        if not statement:
+            raise NotFoundError(f"Statement '{statement_id}' not found")
+
+        result = await self.db.execute(
+            select(StatementImportJob).where(
+                StatementImportJob.statement_id == statement_id,
+                StatementImportJob.user_id == self.user_id,
+            )
+        )
+        job = result.scalar_one_or_none()
+        if not job:
+            raise NotFoundError("Statement import job not found")
+        if statement.status in (StatementStatus.CONFIRMED, StatementStatus.REVIEW_REQUIRED):
+            raise ConflictError("This statement is already ready for review or has been imported")
+        if job.status == StatementStatus.PROCESSING and job.started_at:
+            started_at = job.started_at
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - started_at < timedelta(minutes=5):
+                raise ConflictError("Extraction is still recent. Wait five minutes before retrying.")
+
+        file_path = Path(statement.storage_key)
+        if not file_path.exists():
+            raise StatementValidationError("The uploaded statement file is missing from storage")
+
+        await self.db.execute(delete(StatementRow).where(StatementRow.statement_id == statement.id))
+        await self.db.execute(delete(StatementImportWarning).where(StatementImportWarning.statement_id == statement.id))
+        statement.status = job.status = StatementStatus.PROCESSING
+        statement.period_start = statement.period_end = None
+        statement.opening_balance = statement.closing_balance = None
+        job.started_at = datetime.now(timezone.utc)
+        job.completed_at = None
+        job.error_code = job.error_message = None
+        job.total_rows = job.processed_rows = 0
+        await self.db.commit()
+
+        from app.workers.statement_tasks import process_statement_task
+        try:
+            process_statement_task.delay(str(statement.id), str(file_path))
+        except Exception as exc:
+            statement.status = job.status = StatementStatus.FAILED
+            job.error_code = "QUEUE_FAILURE"
+            job.error_message = f"Could not queue statement extraction: {exc}"
+            job.completed_at = datetime.now(timezone.utc)
+            await self.db.commit()
+        return job
 
     async def _process_statement_internal(
         self, statement: Statement, job: StatementImportJob, file_path: Path
