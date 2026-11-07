@@ -80,6 +80,42 @@ async def get_statement_preview(
     return await service.get_preview(statement_id)
 
 
+@router.post("/{statement_id}/retry", response_model=StatementJobStatusResponse)
+async def retry_statement_extraction(
+    statement_id: uuid.UUID,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    job = await StatementService(db, current_user.id).retry_statement(statement_id)
+    return StatementJobStatusResponse(
+        job_id=job.id,
+        statement_id=job.statement_id,
+        status=job.status,
+        total_rows=job.total_rows,
+        processed_rows=job.processed_rows,
+        error_code=job.error_code,
+        error_message=job.error_message,
+    )
+
+
+@router.get("/jobs/{job_id}", response_model=StatementJobStatusResponse)
+async def get_statement_job_status(
+    job_id: uuid.UUID,
+    current_user: Annotated[User, Depends(get_current_active_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    job = await StatementService(db, current_user.id).get_job_status(job_id)
+    return StatementJobStatusResponse(
+        job_id=job.id,
+        statement_id=job.statement_id,
+        status=job.status,
+        total_rows=job.total_rows,
+        processed_rows=job.processed_rows,
+        error_code=job.error_code,
+        error_message=job.error_message,
+    )
+
+
 @router.post("/{statement_id}/confirm", status_code=status.HTTP_200_OK)
 async def confirm_statement_import(
     statement_id: uuid.UUID,
