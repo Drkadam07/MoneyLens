@@ -93,7 +93,7 @@ class StatementImportJob(Base, CommonMixin):
         nullable=False
     )
     status: Mapped[StatementStatus] = mapped_column(
-        Enum(StatementStatus),
+        Enum(StatementStatus, native_enum=False, length=50),
         default=StatementStatus.QUEUED,
         nullable=False
     )
