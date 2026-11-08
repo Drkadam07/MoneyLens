@@ -106,19 +106,19 @@ class Transaction(Base, CommonMixin):
 
     reference_number: Mapped[Optional[str]] = mapped_column(String(100), index=True, nullable=True)
     payment_method: Mapped[PaymentMethod] = mapped_column(
-        Enum(PaymentMethod),
+        Enum(PaymentMethod, native_enum=False, length=50),
         default=PaymentMethod.OTHER,
         nullable=False,
         index=True
     )
     transaction_kind: Mapped[TransactionKind] = mapped_column(
-        Enum(TransactionKind),
+        Enum(TransactionKind, native_enum=False, length=50),
         default=TransactionKind.UNCLASSIFIED,
         nullable=False,
         index=True
     )
     review_status: Mapped[ReviewStatus] = mapped_column(
-        Enum(ReviewStatus),
+        Enum(ReviewStatus, native_enum=False, length=50),
         default=ReviewStatus.CONFIRMED,
         nullable=False
     )
@@ -152,7 +152,7 @@ class Category(Base, CommonMixin):
         nullable=True
     )
     category_type: Mapped[CategoryType] = mapped_column(
-        Enum(CategoryType),
+        Enum(CategoryType, native_enum=False, length=50),
         default=CategoryType.EXPENSE,
         nullable=False
     )
@@ -180,7 +180,7 @@ class TransactionClassification(Base, CommonMixin):
     )
     confidence: Mapped[float] = mapped_column(Float, default=1.0, nullable=False)
     classification_source: Mapped[ClassificationSource] = mapped_column(
-        Enum(ClassificationSource),
+        Enum(ClassificationSource, native_enum=False, length=50),
         default=ClassificationSource.RULE,
         nullable=False
     )
